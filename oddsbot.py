@@ -251,6 +251,64 @@ def mname(m):
 
 
 # ----------------------------------------------------------------- Telegram
+import html as _html
+import re as _re
+try:
+    from zoneinfo import ZoneInfo
+    TR_TZ, UK_TZ = ZoneInfo("Europe/Istanbul"), ZoneInfo("Europe/London")
+except Exception:
+    TR_TZ = UK_TZ = None
+
+MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos",
+          "Eylül", "Ekim", "Kasım", "Aralık"]
+DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+ENG = "\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F"
+SCO = "\U0001F3F4\U000E0067\U000E0062\U000E0073\U000E0063\U000E0074\U000E007F"
+LEAGUES = {"E0": (ENG, "Premier League"), "E1": (ENG, "Championship"), "E2": (ENG, "League One"),
+           "E3": (ENG, "League Two"), "SC0": (SCO, "İskoç Premiership"), "D1": ("🇩🇪", "Bundesliga"),
+           "D2": ("🇩🇪", "2. Bundesliga"), "I1": ("🇮🇹", "Serie A"), "I2": ("🇮🇹", "Serie B"),
+           "SP1": ("🇪🇸", "La Liga"), "SP2": ("🇪🇸", "La Liga 2"), "F1": ("🇫🇷", "Ligue 1"),
+           "F2": ("🇫🇷", "Ligue 2"), "N1": ("🇳🇱", "Eredivisie"), "B1": ("🇧🇪", "Pro League"),
+           "P1": ("🇵🇹", "Primeira Liga"), "T1": ("🇹🇷", "Süper Lig"), "G1": ("🇬🇷", "Süper Lig (GR)")}
+MARKET_ICON = {"1": "🏠", "X": "🤝", "2": "✈️", "O25": "🔥", "U25": "🧊"}
+
+
+def E(s):
+    return _html.escape(str(s), quote=False)
+
+
+def tr_now():
+    if TR_TZ:
+        return datetime.now(TR_TZ).replace(tzinfo=None)
+    return datetime.utcnow() + timedelta(hours=3)
+
+
+def tr_date_str(d):
+    return "%d %s %s" % (d.day, MONTHS[d.month - 1], DAYS[d.weekday()])
+
+
+def kickoff_tr(d, t):
+    """football-data tarih+saat (UK saati) -> Türkiye saati (naive datetime)"""
+    base = datetime.strptime(d, "%Y-%m-%d")
+    try:
+        hh, mm = (t or "12:00").strip().split(":")[:2]
+        dt = base.replace(hour=int(hh), minute=int(mm))
+    except Exception:
+        dt = base.replace(hour=12)
+    if UK_TZ and TR_TZ:
+        return dt.replace(tzinfo=UK_TZ).astimezone(TR_TZ).replace(tzinfo=None)
+    return dt + timedelta(hours=3)
+
+
+def stars(ev, w):
+    s = 1
+    if ev >= 0.20 and w >= 6:
+        s = 2
+    if ev >= 0.35 and w >= 10:
+        s = 3
+    return "⭐" * s
+
+
 def tg_api(method, payload, timeout=60):
     tok = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not tok:
@@ -266,13 +324,33 @@ def tg_api(method, payload, timeout=60):
         return None
 
 
-def tg(text):
+def plain(s):
+    return _html.unescape(_re.sub(r"<[^>]+>", "", s))
+
+
+def tg(blocks):
+    """blocks: str veya blok listesi. Bloklar arasında boş satır, 3800 karakterde yeni mesaj."""
+    if isinstance(blocks, str):
+        blocks = [blocks]
     chat = os.getenv("TELEGRAM_CHAT_ID", "")
     if not os.getenv("TELEGRAM_BOT_TOKEN") or not chat:
-        print(text)
+        for b in blocks:
+            print(plain(b) + "\n")
         return
-    for i in range(0, len(text), 3900):
-        tg_api("sendMessage", {"chat_id": chat, "text": text[i:i + 3900]})
+    msgs, cur = [], ""
+    for b in blocks:
+        if cur and len(cur) + len(b) + 2 > 3800:
+            msgs.append(cur)
+            cur = ""
+        cur += ("\n\n" if cur else "") + b
+    if cur:
+        msgs.append(cur)
+    for m in msgs:
+        r = tg_api("sendMessage", {"chat_id": chat, "text": m, "parse_mode": "HTML",
+                                   "disable_web_page_preview": True})
+        if not r or not r.get("ok"):   # HTML hatasında düz metinle tekrar dene
+            tg_api("sendMessage", {"chat_id": chat, "text": plain(m)})
+        time.sleep(0.4)
 
 
 # ----------------------------------------------------------------- tarama
@@ -289,58 +367,93 @@ def load_offered(path):
     return out
 
 
-def do_scan(a_days=2, offered_path="htft_odds.csv", quiet=False):
+def do_scan(a_days=2, offered_path="htft_odds.csv"):
     con = db()
     if con.execute("SELECT COUNT(*) FROM matches").fetchone()[0] < 1000:
-        return "Arşiv boş/yetersiz. Önce: python oddsbot.py ingest"
+        return ["⚠️ Arşiv boş/yetersiz. Önce arşivi kur: <code>python oddsbot.py ingest</code>"]
     text = get(BASE + "/fixtures.csv")
     if not text:
-        return "fixtures.csv indirilemedi."
-    key = "scan:" + date.today().isoformat()
+        return ["⚠️ fixtures.csv indirilemedi. Biraz sonra tekrar dene."]
+    now = tr_now()
+    today = now.date()
+    last_day = today + timedelta(days=a_days)
+    key = "scan:" + today.isoformat()
     meta_set(con, key, int(meta_get(con, key, "0") or 0) + 1)
     meta_set(con, "last_scan", time.time())
     offered_all = load_offered(offered_path)
-    today, limit = date.today(), date.today() + timedelta(days=a_days)
-    found, htlines, scanned = [], [], 0
+
+    days, file_max, started = {}, None, 0
     for r in csv.DictReader(io.StringIO(text)):
         d = pdate(r.get("Date"))
-        if not d or not (today.isoformat() <= d <= limit.isoformat()):
+        if not d:
             continue
-        oh, od, oa = (ff(r.get(PFX + k)) for k in "HDA")
+        if not file_max or d > file_max:
+            file_max = d
         home, away = (r.get("HomeTeam") or "").strip(), (r.get("AwayTeam") or "").strip()
+        oh, od, oa = (ff(r.get(PFX + k)) for k in "HDA")
         if None in (oh, od, oa) or not home:
+            continue
+        ko = kickoff_tr(d, r.get("Time"))
+        if ko.date() < today or ko.date() > last_day:
+            continue
+        if ko < now:
+            started += 1
             continue
         fx = dict(oh=oh, od=od, oa=oa, oo=ff(r.get(PFX + ">2.5")), ou=ff(r.get(PFX + "<2.5")))
         picks, htft, n, tol = analyze(con, fx, offered=offered_all.get((d, home, away)))
-        scanned += 1
+        day = days.setdefault(ko.date(), dict(n=0, picks=[], ht=[]))
+        day["n"] += 1
         dv = r.get("Div", "")
         for p in picks:
-            found.append((d, r.get("Time", ""), dv, home, away, p))
+            day["picks"].append((ko, dv, home, away, p, d))
         for h in htft[:1]:
-            htlines.append((h["p_lo"], "%s %s-%s  İY/MS %s: %d/%d (%%%.1f) | adil oran %.1f | ≥%.1f görürsen değer" %
-                            (d[5:], home, away, h["combo"], h["w"], h["n"], h["p"] * 100,
-                             h["fair"], h["breakeven"])))
-    found.sort(key=lambda x: -x[5]["ev"])
-    found = found[:C.top]
-    lines = ["🎯 OddsBot taraması | %d maç incelendi | eşik ≥%.1f oran, EV ≥ %%%d" %
-             (scanned, C.min_odd, C.min_ev * 100)]
-    if not found:
-        lines.append("\nBu tarama için eşiği geçen sürpriz fırsat YOK. (Normal; çoğu gün böyledir.)")
-    for d, t, dv, home, away, p in found:
-        lines.append("\n%s %s [%s]\n%s - %s\n➜ %s @ %.2f\nGeçmişte %d/%d (%%%.1f) | piyasa %%%.1f | temkinli olasılık %%%.1f | EV %%%+.0f" %
-                     (d, t, dv, home, away, mname(p["market"]), p["odd"], p["w"], p["n"],
-                      p["w"] / p["n"] * 100, p["prior"] * 100, p["p_post"] * 100, p["ev"] * 100))
-        con.execute("INSERT OR IGNORE INTO predictions(created,kickoff,div,home,away,market,odd,p_post,ev,n,w) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (datetime.now().isoformat(timespec="seconds"), d, dv, home, away,
-                     p["market"], p["odd"], p["p_post"], p["ev"], p["n"], p["w"]))
+            day["ht"].append((h["p_lo"], ko, home, away, h))
+
+    total = sum(x["n"] for x in days.values())
+    blocks = ["🎯 <b>ODDSBOT • SÜRPRİZ TARAMA</b>\n🗓 %s • 🕐 %s (TR)\n🔎 <b>%d</b> maç incelendi • eşik: oran ≥ <b>%.1f</b> • EV ≥ <b>%%%d</b>" %
+              (tr_date_str(now), now.strftime("%H:%M"), total, C.min_odd, round(C.min_ev * 100))]
+    if today not in days:
+        blocks.append("⚠️ <b>Kaynak uyarısı</b>\nKaynak dosyada bugüne ait, başlamamış maç bulunamadı "
+                      "(dosyadaki son tarih: <code>%s</code>). football-data bu dosyayı haftada birkaç kez günceller; "
+                      "o yüzden bazı günler eksik kalabilir." % E(file_max or "-"))
+
+    shown_ht = []
+    for dday in sorted(days):
+        day = days[dday]
+        day["picks"].sort(key=lambda x: -x[4]["ev"])
+        top = day["picks"][:5]
+        head = "━━━━━━━━━━━━━━━━━━\n📆 <b>%s</b>\n📋 %d maç tarandı • 🎯 %d fırsat" % (tr_date_str(dday), day["n"], len(day["picks"]))
+        blocks.append(head)
+        if not top:
+            blocks.append("😴 Bu gün için eşiği geçen sürpriz fırsat yok.")
+        for ko, dv, home, away, p, fdate in top:
+            flag, lname = LEAGUES.get(dv, ("🌍", dv))
+            icon = MARKET_ICON.get(p["market"], "⏱️")
+            if p["market"].startswith("HTFT"):
+                extra = "📊 Geçmişte <code>%d/%d</code> (<b>%%%.1f</b>) • iddaa oranı verdiğin dosyadan" % (p["w"], p["n"], p["w"] / p["n"] * 100)
+            else:
+                extra = "📊 Geçmişte <code>%d/%d</code> (<b>%%%.1f</b>) • piyasa %%%.1f" % (p["w"], p["n"], p["w"] / p["n"] * 100, p["prior"] * 100)
+            blocks.append("⚽ <b>%s – %s</b>\n%s %s • 🕐 %s\n%s <b>%s</b> @ <code>%.2f</code>  %s\n%s\n🧠 Temkinli olasılık %%%.1f • 💰 EV <b>%%%+.0f</b>" %
+                          (E(home), E(away), flag, E(lname), ko.strftime("%H:%M"),
+                           icon, E(mname(p["market"])), p["odd"], stars(p["ev"], p["w"]),
+                           extra, p["p_post"] * 100, p["ev"] * 100))
+            con.execute("INSERT OR IGNORE INTO predictions(created,kickoff,div,home,away,market,odd,p_post,ev,n,w) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (datetime.now().isoformat(timespec="seconds"), fdate, dv, home, away,
+                         p["market"], p["odd"], p["p_post"], p["ev"], p["n"], p["w"]))
+        shown_ht += day["ht"]
     con.commit()
-    if htlines:
-        htlines.sort(reverse=True)
-        lines.append("\n💣 İY/MS fiyat rehberi (iddaa oranı bu eşiğin ÜSTÜNDEYSE değer):")
-        lines += ["• " + x[1] for x in htlines[:6]]
-    lines.append("\n⚠️ Sanal kasada izle; geçmiş sıklık gelecek garantisi değildir.")
-    return "\n".join(lines)
+
+    if shown_ht:
+        shown_ht.sort(key=lambda x: -x[0])
+        lines = ["💣 <b>İY/MS fiyat rehberi</b>\n<i>İddaa oranı eşiğin ÜSTÜNDEYSE değerli sayılır.</i>"]
+        for p_lo, ko, home, away, h in shown_ht[:6]:
+            lines.append("• <b>%s</b> %s–%s (%s)\n   <code>%d/%d</code> (%%%.1f) • adil <code>%.1f</code> • değer eşiği ≥ <code>%.1f</code>" %
+                         (h["combo"], E(home), E(away), ko.strftime("%d.%m %H:%M"), h["w"], h["n"],
+                          h["p"] * 100, h["fair"], h["breakeven"]))
+        blocks.append("\n".join(lines))
+    blocks.append("⚠️ <i>Sanal kasada izle. Geçmiş sıklık gelecek garantisi değildir.</i>")
+    return blocks
 
 
 def cmd_scan(a):
@@ -352,7 +465,7 @@ def do_audit():
     con = db()
     pend = con.execute("SELECT rowid,div,kickoff,home,away,market,odd FROM predictions WHERE status='PENDING'").fetchall()
     if not pend:
-        return "Bekleyen tahmin yok."
+        return ["📒 <b>ODDSBOT • KARNE</b>\n😴 Bekleyen tahmin yok."]
     texts = {}
     for div in {p[1] for p in pend}:
         t = get("%s/mmz4281/%s/%s.csv" % (BASE, season_codes(1)[0], div))
@@ -369,7 +482,7 @@ def do_audit():
                 o = outcomes(hg, ag, fi(r.get("HTHG")), fi(r.get("HTAG")))
                 won = bool(o.get(mk))
                 clv = None
-                if mk in "1X2" and len(mk) == 1:
+                if mk in ("1", "X", "2"):
                     c = ff(r.get(PFX + "C" + {"1": "H", "X": "D", "2": "A"}[mk]))
                     clv = odd / c - 1 if c else None
                 con.execute("UPDATE predictions SET status=?,score=?,clv=? WHERE rowid=?",
@@ -385,16 +498,24 @@ def do_audit():
     clvs = [r[2] for r in rows if r[2] is not None]
     last = con.execute("SELECT kickoff,home,away,market,odd,status,score FROM predictions "
                        "WHERE status!='PENDING' ORDER BY rowid DESC LIMIT 8").fetchall()
-    lines = ["📒 Karne | bu turda sonuçlanan: %d | bekleyen: %d" % (settled, len(pend) - settled),
-             "Toplam: %d tahmin | %d tuttu (%%%.1f) | 1 birim bahisle kâr/zarar: %+.2f birim | ROI %%%+.1f" %
-             (n, wins, wins / n * 100 if n else 0, profit, profit / n * 100 if n else 0)]
-    if clvs:
-        lines.append("Ort. CLV (kapanışa karşı): %%%+.1f  (kalıcı pozitifse gerçek avantaj işareti)" % (sum(clvs) / len(clvs) * 100))
-    for k, h, a, m, o, st, sc in last:
-        lines.append("%s %s %s-%s | %s @%.2f | %s %s" % ("✅" if st == "WON" else "❌", k[5:], h, a, mname(m), o, st, sc))
+    now = tr_now()
+    blocks = ["📒 <b>ODDSBOT • KARNE</b>\n🗓 %s • 🕐 %s (TR)\n✅ Bu turda sonuçlanan: <b>%d</b> • ⏳ bekleyen: <b>%d</b>" %
+              (tr_date_str(now), now.strftime("%H:%M"), settled, len(pend) - settled)]
+    if n:
+        s = "📈 <b>Genel durum</b>\n🎯 Tahmin: <code>%d</code> • ✅ Tutan: <code>%d</code> (<b>%%%.1f</b>)\n💵 Kâr/zarar: <code>%+.2f br</code> • ROI <b>%%%+.1f</b>" % \
+            (n, wins, wins / n * 100, profit, profit / n * 100)
+        if clvs:
+            s += "\n📐 Ort. CLV: <b>%%%+.1f</b> <i>(kalıcı pozitifse gerçek avantaj işareti)</i>" % (sum(clvs) / len(clvs) * 100)
+        blocks.append(s)
+    if last:
+        lines = ["🧾 <b>Son sonuçlar</b>"]
+        for k, h, a_, m, o, st, sc in last:
+            lines.append("%s <code>%s</code> %s – %s\n    %s @ <code>%.2f</code> • %s" %
+                         ("✅" if st == "WON" else "❌", k[5:].replace("-", "."), E(h), E(a_), E(mname(m)), o, E(sc)))
+        blocks.append("\n".join(lines))
     if n < 100:
-        lines.append("\nℹ️ %d örnek çok az; yüzlerce tahmin birikmeden sonuca güvenme." % n)
-    return "\n".join(lines)
+        blocks.append("ℹ️ <i>%d örnek çok az; yüzlerce tahmin birikmeden sonuca güvenme.</i>" % n)
+    return blocks
 
 
 def cmd_audit(a):
@@ -455,16 +576,16 @@ def cmd_bot(a):
             if cmd == "/tara":
                 last = float(meta_get(con, "last_scan", "0") or 0)
                 if time.time() - last < 600:
-                    tg("⏳ Son taramadan 10 dk geçmedi, bekle (kota koruması).")
+                    tg("⏳ Son taramadan 10 dk geçmedi, biraz bekle (kota koruması).")
                 else:
                     tg(do_scan(2))
             elif cmd == "/karne":
                 tg(do_audit())
             elif cmd == "/kota":
-                k = "scan:" + date.today().isoformat()
-                tg("Bugün %s tarama yapıldı. Kaynak ücretsiz CSV; yine de 10 dk bekleme uygulanıyor." % meta_get(con, k, "0"))
+                k = "scan:" + tr_now().date().isoformat()
+                tg("📊 <b>Kota</b>\nBugün <b>%s</b> tarama yapıldı.\nKaynak ücretsiz CSV; yine de 10 dk bekleme uygulanıyor." % meta_get(con, k, "0"))
             else:
-                tg("Komutlar: /tara  /karne  /kota")
+                tg("🤖 <b>Komutlar</b>\n/tara – günün taraması\n/karne – sonuç karnesi\n/kota – tarama sayacı")
 
 
 # ----------------------------------------------------------------- panel (dashboard.html)
