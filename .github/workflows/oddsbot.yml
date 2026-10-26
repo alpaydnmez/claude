@@ -1,1 +1,79 @@
+name: oddsbot
 
+on:
+  schedule:
+    - cron: "30 13 * * *"   # 16:30 TR  -> günlük tarama
+    - cron: "30 23 * * *"   # 02:30 TR  -> gece karnesi
+    - cron: "0 4 * * 1"     # Pazartesi 07:00 TR -> güncel sezon arşiv yenileme
+  workflow_dispatch:         # Actions sekmesinde "Run workflow" butonu (manuel /tara)
+    inputs:
+      task:
+        description: "Çalıştırılacak iş"
+        type: choice
+        default: scan
+        options: [scan, audit, ingest, backtest]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: oddsbot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      EVENT: ${{ github.event_name }}
+      SCHEDULE: ${{ github.event.schedule }}
+      INPUT_TASK: ${{ inputs.task }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Veritabanını geri yükle (data dalı)
+        run: |
+          git fetch origin data --depth=1 || true
+          git show origin/data:oddsbot.db > oddsbot.db 2>/dev/null || rm -f oddsbot.db
+          ls -la oddsbot.db || echo "Henüz veritabanı yok"
+
+      - name: İşi belirle
+        id: t
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then T="$INPUT_TASK"
+          elif [ "$SCHEDULE" = "30 13 * * *" ]; then T="scan"
+          elif [ "$SCHEDULE" = "30 23 * * *" ]; then T="audit"
+          else T="refresh"; fi
+          echo "task=$T" >> "$GITHUB_OUTPUT"
+
+      - name: İlk kurulum (arşiv yoksa 10 sezon indir)
+        run: |
+          if [ ! -s oddsbot.db ]; then python oddsbot.py ingest --seasons 10; fi
+
+      - name: Çalıştır
+        run: |
+          case "${{ steps.t.outputs.task }}" in
+            scan)     python oddsbot.py scan ;;
+            audit)    python oddsbot.py audit ;;
+            ingest)   python oddsbot.py ingest --seasons 10 ;;
+            refresh)  python oddsbot.py ingest --seasons 1 ;;
+            backtest) python oddsbot.py backtest --seasons-test 2 ;;
+          esac
+
+      - name: Veritabanını data dalına kaydet (geçmiş tutmadan)
+        run: |
+          mkdir /tmp/d && cp oddsbot.db /tmp/d/
+          cd /tmp/d
+          git init -q -b data
+          git config user.name "oddsbot"
+          git config user.email "oddsbot@users.noreply.github.com"
+          git add oddsbot.db
+          git commit -qm "db $(date -u +%F-%H%M)"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" data
