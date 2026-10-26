@@ -17,6 +17,7 @@ Komutlar:
   python oddsbot.py scan [--days 2]                        günün taraması + Telegram
   python oddsbot.py audit                                  biten maçları karnele
   python oddsbot.py bot                                    Telegram'da /tara /karne /kota
+  python oddsbot.py export [--out dashboard.html]          verileri gösteren HTML panel
 """
 import argparse, csv, io, json, math, os, sqlite3, sys, time, urllib.request
 from datetime import datetime, date, timedelta
@@ -466,6 +467,114 @@ def cmd_bot(a):
                 tg("Komutlar: /tara  /karne  /kota")
 
 
+# ----------------------------------------------------------------- panel (dashboard.html)
+DASH_HTML = r"""<!DOCTYPE html>
+<html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OddsBot Panel</title>
+<style>
+:root{--bg:#ffffff;--card:#f3f5f9;--tx:#111827;--mut:#6b7280;--bd:#e2e5ec;--ok:#047857;--bad:#b91c1c;--acc:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#0b1020;--card:#131a2e;--tx:#e5e7eb;--mut:#94a3b8;--bd:#25304d;--ok:#34d399;--bad:#f87171;--acc:#60a5fa}}
+*{box-sizing:border-box}
+body{margin:0;padding:14px;background:var(--bg);color:var(--tx);font:14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;max-width:1100px;margin-inline:auto}
+h1{font-size:19px;margin:0 0 2px}h2{font-size:15px;margin:22px 0 8px}
+.mut{color:var(--mut);font-size:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:12px}
+.c{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:10px}
+.c span{display:block;font-size:11px;color:var(--mut)}.c b{font-size:18px}
+.warn{background:rgba(245,158,11,.15);border:1px solid #f59e0b;border-radius:10px;padding:9px 11px;margin-top:12px;font-size:13px}
+.wrap{overflow-x:auto;border:1px solid var(--bd);border-radius:10px}
+table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:640px}
+th,td{padding:7px 9px;text-align:left;border-bottom:1px solid var(--bd);white-space:nowrap}
+th{background:var(--card);color:var(--mut);font-size:11px;text-transform:uppercase}
+tr:last-child td{border-bottom:none}
+.ok{color:var(--ok);font-weight:700}.bad{color:var(--bad);font-weight:700}
+svg{width:100%;height:auto;background:var(--card);border:1px solid var(--bd);border-radius:10px}
+</style></head><body>
+<h1>OddsBot Panel</h1>
+<div class="mut" id="sub"></div>
+<div id="warn"></div>
+<div class="cards" id="cards"></div>
+<h2>Kümülatif kâr/zarar (1 birim bahis)</h2><div id="chart"></div>
+<h2>Oran bandına göre kalibrasyon</h2><div class="wrap"><table id="bands"></table></div>
+<h2>Bekleyen tahminler</h2><div class="wrap"><table id="pend"></table></div>
+<h2>Sonuçlanan tahminler</h2><div class="wrap"><table id="done"></table></div>
+<script>
+const D=/*DATA*/null;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pc=(x,d=1)=>(x*100).toFixed(d)+"%";
+const P=D.predictions,S=P.filter(p=>p.status!=="PENDING"),pend=P.filter(p=>p.status==="PENDING");
+const W=S.filter(p=>p.status==="WON");
+const ret=p=>p.status==="WON"?p.odd-1:-1;
+const profit=S.reduce((a,p)=>a+ret(p),0);
+const clv=S.filter(p=>p.clv!=null).map(p=>p.clv);
+const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:0;
+$("#sub").textContent="Arşiv: "+D.archive.count+" maç ("+D.archive.min+" – "+D.archive.max+") | Son tarama: "+D.last_scan+" | Üretildi: "+D.generated;
+if(S.length<100)$("#warn").innerHTML='<div class="warn">Yalnızca '+S.length+' sonuçlanmış tahmin var. Yüzlerce örnek birikmeden isabet oranı ve ROI güvenilir değildir.</div>';
+const card=(k,v)=>'<div class="c"><span>'+k+'</span><b>'+v+'</b></div>';
+$("#cards").innerHTML=card("Bekleyen",pend.length)+card("Sonuçlanan",S.length)+
+ card("Tutan",W.length)+card("Tutma oranı",S.length?pc(W.length/S.length):"-")+
+ card("Kâr/zarar",(profit>=0?"+":"")+profit.toFixed(2)+" br")+
+ card("ROI",S.length?(profit/S.length*100).toFixed(1)+"%":"-")+
+ card("Ort. CLV",clv.length?(avg(clv)*100).toFixed(1)+"%":"-");
+// grafik
+const asc=[...S].sort((a,b)=>a.kickoff<b.kickoff?-1:1);
+let cum=0;const pts=asc.map(p=>cum+=ret(p));
+if(pts.length>1){
+ const w=600,h=180,pad=24,mn=Math.min(0,...pts),mx=Math.max(0,...pts),rg=(mx-mn)||1;
+ const x=i=>pad+i*(w-2*pad)/(pts.length-1),y=v=>h-pad-(v-mn)*(h-2*pad)/rg;
+ const line=pts.map((v,i)=>x(i).toFixed(1)+","+y(v).toFixed(1)).join(" ");
+ $("#chart").innerHTML='<svg viewBox="0 0 '+w+' '+h+'"><line x1="'+pad+'" x2="'+(w-pad)+'" y1="'+y(0)+'" y2="'+y(0)+'" stroke="currentColor" stroke-opacity=".3" stroke-dasharray="4"/><polyline fill="none" stroke="var(--acc)" stroke-width="2" points="'+line+'"/><text x="'+pad+'" y="14" font-size="11" fill="currentColor">Son: '+pts[pts.length-1].toFixed(2)+' br</text></svg>';
+}else $("#chart").innerHTML='<div class="mut">Grafik için en az 2 sonuçlanmış tahmin gerekir.</div>';
+// bantlar
+const bands=[["4–6",4,6],["6–10",6,10],["10–20",10,20],["20+",20,1e9]];
+let bh="<tr><th>Oran bandı</th><th>Tahmin</th><th>Tuttu</th><th>Gerçekleşen</th><th>Model olasılığı (ort.)</th><th>ROI</th></tr>";
+for(const [nm,lo,hi] of bands){
+ const s=S.filter(p=>p.odd>=lo&&p.odd<hi);
+ if(!s.length){bh+="<tr><td>"+nm+"</td><td colspan=5 class=mut>veri yok</td></tr>";continue}
+ const w=s.filter(p=>p.status==="WON").length,pr=s.reduce((a,p)=>a+ret(p),0);
+ bh+="<tr><td>"+nm+"</td><td>"+s.length+"</td><td>"+w+"</td><td>"+pc(w/s.length)+"</td><td>"+pc(avg(s.map(p=>p.p_post)))+"</td><td class="+(pr>=0?"ok":"bad")+">"+(pr/s.length*100).toFixed(1)+"%</td></tr>";
+}
+$("#bands").innerHTML=bh;
+// bekleyen
+let ph="<tr><th>Tarih</th><th>Lig</th><th>Maç</th><th>Seçim</th><th>Oran</th><th>Geçmiş</th><th>Model p</th><th>EV</th></tr>";
+ph+=pend.map(p=>"<tr><td>"+esc(p.kickoff)+"</td><td>"+esc(p.div)+"</td><td>"+esc(p.home)+" - "+esc(p.away)+"</td><td>"+esc(p.market_name)+"</td><td>"+p.odd.toFixed(2)+"</td><td>"+p.w+"/"+p.n+" ("+pc(p.w/p.n)+")</td><td>"+pc(p.p_post)+"</td><td>"+(p.ev*100).toFixed(0)+"%</td></tr>").join("")||"<tr><td colspan=8 class=mut>Bekleyen tahmin yok</td></tr>";
+$("#pend").innerHTML=ph;
+// sonuçlanan
+let dh="<tr><th>Tarih</th><th>Maç</th><th>Seçim</th><th>Oran</th><th>Skor</th><th>Sonuç</th><th>CLV</th></tr>";
+dh+=S.map(p=>"<tr><td>"+esc(p.kickoff)+"</td><td>"+esc(p.home)+" - "+esc(p.away)+"</td><td>"+esc(p.market_name)+"</td><td>"+p.odd.toFixed(2)+"</td><td>"+esc(p.score)+"</td><td class="+(p.status==="WON"?"ok":"bad")+">"+(p.status==="WON"?"TUTTU":"YATTI")+"</td><td>"+(p.clv==null?"-":(p.clv*100).toFixed(1)+"%")+"</td></tr>").join("")||"<tr><td colspan=7 class=mut>Henüz sonuçlanan tahmin yok</td></tr>";
+$("#done").innerHTML=dh;
+</script></body></html>"""
+
+
+def build_dashboard(con):
+    cols = ("created", "kickoff", "div", "home", "away", "market", "odd", "p_post",
+            "ev", "n", "w", "status", "score", "clv")
+    preds = [dict(zip(cols, r)) for r in con.execute(
+        "SELECT %s FROM predictions ORDER BY kickoff DESC, rowid DESC" % ",".join(cols))]
+    for p in preds:
+        p["market_name"] = mname(p["market"])
+    cnt, mn, mx = con.execute("SELECT COUNT(*),MIN(date),MAX(date) FROM matches").fetchone()
+    ls = meta_get(con, "last_scan", "")
+    try:
+        ls = datetime.fromtimestamp(float(ls)).strftime("%d.%m.%Y %H:%M") if ls else "-"
+    except Exception:
+        ls = "-"
+    data = dict(predictions=preds, archive=dict(count=cnt, min=mn or "-", max=mx or "-"),
+                last_scan=ls, generated=datetime.now().strftime("%d.%m.%Y %H:%M"))
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return DASH_HTML.replace("/*DATA*/null", payload)
+
+
+def cmd_export(a):
+    con = db()
+    html = build_dashboard(con)
+    with open(a.out, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print("Panel yazıldı:", a.out)
+
+
 def main():
     ap = argparse.ArgumentParser(description="OddsBot")
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -473,6 +582,7 @@ def main():
     p = sp.add_parser("backtest"); p.add_argument("--seasons-test", type=int, default=1)
     p = sp.add_parser("scan"); p.add_argument("--days", type=int, default=2)
     sp.add_parser("audit"); sp.add_parser("bot")
+    p = sp.add_parser("export"); p.add_argument("--out", default="dashboard.html")
     for s in sp.choices.values():
         s.add_argument("--min-odd", type=float); s.add_argument("--min-ev", type=float)
         s.add_argument("--min-n", type=int); s.add_argument("--k", type=float)
@@ -481,7 +591,7 @@ def main():
         if getattr(a, src, None) is not None:
             setattr(C, dst, getattr(a, src))
     {"ingest": cmd_ingest, "backtest": cmd_backtest, "scan": cmd_scan,
-     "audit": cmd_audit, "bot": cmd_bot}[a.cmd](a)
+     "audit": cmd_audit, "bot": cmd_bot, "export": cmd_export}[a.cmd](a)
 
 
 if __name__ == "__main__":
