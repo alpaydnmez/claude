@@ -67,13 +67,23 @@ jobs:
             backtest) python oddsbot.py backtest --seasons-test 2 ;;
           esac
 
+      - name: Paneli üret (dashboard.html)
+        run: python oddsbot.py export --out dashboard.html
+
+      - name: Paneli indirilebilir yap
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard
+          path: dashboard.html
+          retention-days: 30
+
       - name: Veritabanını data dalına kaydet (geçmiş tutmadan)
         run: |
-          mkdir /tmp/d && cp oddsbot.db /tmp/d/
+          mkdir /tmp/d && cp oddsbot.db dashboard.html /tmp/d/
           cd /tmp/d
           git init -q -b data
           git config user.name "oddsbot"
           git config user.email "oddsbot@users.noreply.github.com"
-          git add oddsbot.db
+          git add oddsbot.db dashboard.html
           git commit -qm "db $(date -u +%F-%H%M)"
           git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" data
