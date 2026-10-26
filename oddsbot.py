@@ -251,6 +251,11 @@ def mname(m):
 
 
 # ----------------------------------------------------------------- Telegram
+import difflib
+import statistics
+import unicodedata
+import urllib.parse
+from datetime import timezone
 import html as _html
 import re as _re
 try:
@@ -367,13 +372,111 @@ def load_offered(path):
     return out
 
 
+ODDS_API = "https://api.the-odds-api.com/v4"
+ODDS_SPORTS = {
+    "soccer_turkey_super_league": "T1", "soccer_epl": "E0", "soccer_efl_champ": "E1",
+    "soccer_england_league1": "E2", "soccer_england_league2": "E3", "soccer_spl": "SC0",
+    "soccer_germany_bundesliga": "D1", "soccer_germany_bundesliga2": "D2",
+    "soccer_italy_serie_a": "I1", "soccer_italy_serie_b": "I2",
+    "soccer_spain_la_liga": "SP1", "soccer_spain_segunda_division": "SP2",
+    "soccer_france_ligue_one": "F1", "soccer_france_ligue_two": "F2",
+    "soccer_netherlands_eredivisie": "N1", "soccer_belgium_first_div": "B1",
+    "soccer_portugal_primeira_liga": "P1", "soccer_greece_super_league": "G1"}
+DEFAULT_ODDS_LEAGUES = ["T1", "E0", "SP1", "I1", "D1", "F1", "P1", "N1"]
+
+
+def oddsapi_get(path, params):
+    key = os.getenv("ODDS_API_KEY", "").strip()
+    url = ODDS_API + path + "?" + urllib.parse.urlencode(dict(params, apiKey=key))
+    req = urllib.request.Request(url, headers={"User-Agent": "oddsbot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read()), r.headers.get("x-requests-remaining")
+    except urllib.error.HTTPError as e:      # URL (anahtar içerir) asla yazdırılmaz
+        print("Odds API HTTP hatası:", e.code, file=sys.stderr)
+        raise
+    except Exception as e:
+        print("Odds API hatası:", type(e).__name__, file=sys.stderr)
+        raise
+
+
+def parse_event(ev, div):
+    """Odds API etkinliği -> fikstür sözlüğü (bahis şirketleri medyanı)."""
+    hs, ds, as_, os_, us = [], [], [], [], []
+    home, away = ev.get("home_team", ""), ev.get("away_team", "")
+    for bk in ev.get("bookmakers", []):
+        for mk in bk.get("markets", []):
+            if mk.get("key") == "h2h":
+                m = {o.get("name"): o.get("price") for o in mk.get("outcomes", [])}
+                h, d, a_ = m.get(home), m.get("Draw"), m.get(away)
+                if h and d and a_:
+                    hs.append(h); ds.append(d); as_.append(a_)
+            elif mk.get("key") == "totals":
+                for o in mk.get("outcomes", []):
+                    if o.get("point") == 2.5 and o.get("price"):
+                        (os_ if o.get("name") == "Over" else us).append(o["price"])
+    if not hs:
+        return None
+    try:
+        utc = datetime.strptime(ev["commence_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    if TR_TZ and UK_TZ:
+        ko = utc.astimezone(TR_TZ).replace(tzinfo=None)
+        uk_date = utc.astimezone(UK_TZ).date().isoformat()
+    else:
+        ko = utc.replace(tzinfo=None) + timedelta(hours=3)
+        uk_date = utc.date().isoformat()
+    med = statistics.median
+    fx = dict(oh=med(hs), od=med(ds), oa=med(as_),
+              oo=med(os_) if os_ and us else None, ou=med(us) if os_ and us else None)
+    return dict(ko=ko, d=uk_date, div=div, home=home, away=away, fx=fx, src="oddsapi")
+
+
+def fetch_oddsapi(con):
+    """Yedek kaynak. Döner: (fikstür listesi, durum, kalan kredi)"""
+    if not os.getenv("ODDS_API_KEY", "").strip():
+        return [], "no_key", None
+    rem = meta_get(con, "oddsapi_remaining", "")
+    if rem.isdigit() and int(rem) < 25:
+        return [], "low_quota", rem
+    want = os.getenv("ODDS_API_LEAGUES", "").strip()
+    if want.upper() == "ALL":
+        divs = list(ODDS_SPORTS.values())
+    elif want:
+        divs = [x.strip() for x in want.split(",") if x.strip()]
+    else:
+        divs = DEFAULT_ODDS_LEAGUES
+    try:
+        sports, _ = oddsapi_get("/sports/", {})          # ücretsiz çağrı: aktif ligleri doğrular
+    except Exception:
+        return [], "error", None
+    active = {s.get("key") for s in sports if s.get("active")}
+    out, remaining = [], None
+    for sk, dv in ODDS_SPORTS.items():
+        if dv not in divs or sk not in active:
+            continue
+        try:
+            evs, rm = oddsapi_get("/sports/%s/odds/" % sk, dict(
+                regions="eu", markets="h2h,totals", oddsFormat="decimal", dateFormat="iso"))
+        except Exception:
+            continue
+        if rm is not None:
+            remaining = rm
+        for ev in evs:
+            p = parse_event(ev, dv)
+            if p:
+                out.append(p)
+    if remaining is not None:
+        meta_set(con, "oddsapi_remaining", remaining)
+    return out, "ok", remaining
+
+
 def do_scan(a_days=2, offered_path="htft_odds.csv"):
     con = db()
     if con.execute("SELECT COUNT(*) FROM matches").fetchone()[0] < 1000:
         return ["⚠️ Arşiv boş/yetersiz. Önce arşivi kur: <code>python oddsbot.py ingest</code>"]
     text = get(BASE + "/fixtures.csv")
-    if not text:
-        return ["⚠️ fixtures.csv indirilemedi. Biraz sonra tekrar dene."]
     now = tr_now()
     today = now.date()
     last_day = today + timedelta(days=a_days)
@@ -382,8 +485,8 @@ def do_scan(a_days=2, offered_path="htft_odds.csv"):
     meta_set(con, "last_scan", time.time())
     offered_all = load_offered(offered_path)
 
-    days, file_max, started = {}, None, 0
-    for r in csv.DictReader(io.StringIO(text)):
+    fixtures, file_max = [], None
+    for r in (csv.DictReader(io.StringIO(text)) if text else []):
         d = pdate(r.get("Date"))
         if not d:
             continue
@@ -394,49 +497,72 @@ def do_scan(a_days=2, offered_path="htft_odds.csv"):
         if None in (oh, od, oa) or not home:
             continue
         ko = kickoff_tr(d, r.get("Time"))
-        if ko.date() < today or ko.date() > last_day:
+        if ko.date() < today or ko.date() > last_day or ko < now:
             continue
-        if ko < now:
-            started += 1
-            continue
-        fx = dict(oh=oh, od=od, oa=oa, oo=ff(r.get(PFX + ">2.5")), ou=ff(r.get(PFX + "<2.5")))
-        picks, htft, n, tol = analyze(con, fx, offered=offered_all.get((d, home, away)))
-        day = days.setdefault(ko.date(), dict(n=0, picks=[], ht=[]))
+        fixtures.append(dict(ko=ko, d=d, div=r.get("Div", ""), home=home, away=away, src="fd",
+                             fx=dict(oh=oh, od=od, oa=oa, oo=ff(r.get(PFX + ">2.5")), ou=ff(r.get(PFX + "<2.5")))))
+
+    # Kaynak dosyada eksik gün varsa yedek kaynağı kullan
+    window = [today + timedelta(days=i) for i in range(a_days + 1)]
+    have = {f["ko"].date() for f in fixtures}
+    missing = [d for d in window if d not in have]
+    note = None
+    if missing:
+        extra, status, rem = fetch_oddsapi(con)
+        added = 0
+        if status == "ok":
+            for e in extra:
+                if e["ko"] >= now and e["ko"].date() in missing and e["ko"].date() <= last_day:
+                    fixtures.append(e)
+                    added += 1
+        msgs = {"no_key": "↪️ Yedek kaynak kapalı: <code>ODDS_API_KEY</code> tanımlı değil.",
+                "low_quota": "↪️ Yedek kaynak atlandı: kalan kredi çok az (<code>%s</code>)." % E(rem),
+                "error": "↪️ Yedek kaynağa (Odds API) ulaşılamadı.",
+                "ok": "↪️ The Odds API ile tamamlandı: <b>+%d</b> maç • kalan kredi: <code>%s</code>" % (added, E(rem if rem is not None else "?"))}
+        note = ("⚠️ <b>Kaynak uyarısı</b>\nfootball-data dosyasında şu günlerin maçı yok: <b>%s</b>\n"
+                "(dosyadaki son tarih: <code>%s</code>)\n%s" %
+                (", ".join("%d %s" % (d.day, MONTHS[d.month - 1]) for d in missing), E(file_max or "-"), msgs[status]))
+    if not text and not fixtures:
+        note = (note or "") + "\n⚠️ fixtures.csv indirilemedi."
+
+    days = {}
+    for f in fixtures:
+        picks, htft, n, tol = analyze(con, f["fx"], offered=offered_all.get((f["d"], f["home"], f["away"])))
+        day = days.setdefault(f["ko"].date(), dict(n=0, picks=[], ht=[], src=set()))
         day["n"] += 1
-        dv = r.get("Div", "")
+        day["src"].add(f["src"])
         for p in picks:
-            day["picks"].append((ko, dv, home, away, p, d))
+            day["picks"].append((f["ko"], f["div"], f["home"], f["away"], p, f["d"]))
         for h in htft[:1]:
-            day["ht"].append((h["p_lo"], ko, home, away, h))
+            day["ht"].append((h["p_lo"], f["ko"], f["home"], f["away"], h))
 
     total = sum(x["n"] for x in days.values())
     blocks = ["🎯 <b>ODDSBOT • SÜRPRİZ TARAMA</b>\n🗓 %s • 🕐 %s (TR)\n🔎 <b>%d</b> maç incelendi • eşik: oran ≥ <b>%.1f</b> • EV ≥ <b>%%%d</b>" %
               (tr_date_str(now), now.strftime("%H:%M"), total, C.min_odd, round(C.min_ev * 100))]
-    if today not in days:
-        blocks.append("⚠️ <b>Kaynak uyarısı</b>\nKaynak dosyada bugüne ait, başlamamış maç bulunamadı "
-                      "(dosyadaki son tarih: <code>%s</code>). football-data bu dosyayı haftada birkaç kez günceller; "
-                      "o yüzden bazı günler eksik kalabilir." % E(file_max or "-"))
+    if note:
+        blocks.append(note)
 
     shown_ht = []
     for dday in sorted(days):
         day = days[dday]
         day["picks"].sort(key=lambda x: -x[4]["ev"])
         top = day["picks"][:5]
-        head = "━━━━━━━━━━━━━━━━━━\n📆 <b>%s</b>\n📋 %d maç tarandı • 🎯 %d fırsat" % (tr_date_str(dday), day["n"], len(day["picks"]))
-        blocks.append(head)
+        src_tag = " • 📡 yedek kaynak" if "oddsapi" in day["src"] else ""
+        blocks.append("━━━━━━━━━━━━━━━━━━\n📆 <b>%s</b>\n📋 %d maç tarandı • 🎯 %d fırsat%s" %
+                      (tr_date_str(dday), day["n"], len(day["picks"]), src_tag))
         if not top:
             blocks.append("😴 Bu gün için eşiği geçen sürpriz fırsat yok.")
         for ko, dv, home, away, p, fdate in top:
             flag, lname = LEAGUES.get(dv, ("🌍", dv))
             icon = MARKET_ICON.get(p["market"], "⏱️")
             if p["market"].startswith("HTFT"):
-                extra = "📊 Geçmişte <code>%d/%d</code> (<b>%%%.1f</b>) • iddaa oranı verdiğin dosyadan" % (p["w"], p["n"], p["w"] / p["n"] * 100)
+                extra_line = "📊 Geçmişte <code>%d/%d</code> (<b>%%%.1f</b>) • iddaa oranı verdiğin dosyadan" % (p["w"], p["n"], p["w"] / p["n"] * 100)
             else:
-                extra = "📊 Geçmişte <code>%d/%d</code> (<b>%%%.1f</b>) • piyasa %%%.1f" % (p["w"], p["n"], p["w"] / p["n"] * 100, p["prior"] * 100)
+                extra_line = "📊 Geçmişte <code>%d/%d</code> (<b>%%%.1f</b>) • piyasa %%%.1f" % (p["w"], p["n"], p["w"] / p["n"] * 100, p["prior"] * 100)
             blocks.append("⚽ <b>%s – %s</b>\n%s %s • 🕐 %s\n%s <b>%s</b> @ <code>%.2f</code>  %s\n%s\n🧠 Temkinli olasılık %%%.1f • 💰 EV <b>%%%+.0f</b>" %
                           (E(home), E(away), flag, E(lname), ko.strftime("%H:%M"),
                            icon, E(mname(p["market"])), p["odd"], stars(p["ev"], p["w"]),
-                           extra, p["p_post"] * 100, p["ev"] * 100))
+                           extra_line, p["p_post"] * 100, p["ev"] * 100))
             con.execute("INSERT OR IGNORE INTO predictions(created,kickoff,div,home,away,market,odd,p_post,ev,n,w) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (datetime.now().isoformat(timespec="seconds"), fdate, dv, home, away,
@@ -444,6 +570,8 @@ def do_scan(a_days=2, offered_path="htft_odds.csv"):
         shown_ht += day["ht"]
     con.commit()
 
+    if not days:
+        blocks.append("😴 Pencerede (bugün + %d gün) taranacak başlamamış maç bulunamadı." % a_days)
     if shown_ht:
         shown_ht.sort(key=lambda x: -x[0])
         lines = ["💣 <b>İY/MS fiyat rehberi</b>\n<i>İddaa oranı eşiğin ÜSTÜNDEYSE değerli sayılır.</i>"]
@@ -461,6 +589,36 @@ def cmd_scan(a):
 
 
 # ----------------------------------------------------------------- karne
+
+_STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "us", "calcio", "club", "the", "and", "de", "sk", "fk"}
+
+
+def _tokens(s):
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
+    s = _re.sub(r"[^a-z0-9 ]", " ", s.replace("'", ""))
+    return [t for t in s.split() if t not in _STOP]
+
+
+def same_team(a, b):
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return False
+    x, y = "".join(ta), "".join(tb)
+    if x == y or x in y or y in x:
+        return True
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if all(any(l.startswith(s_) for l in long_) for s_ in short):
+        return True
+    return difflib.SequenceMatcher(None, x, y).ratio() >= 0.72
+
+
+def date_close(d1, d2):
+    try:
+        return abs((datetime.strptime(d1, "%Y-%m-%d") - datetime.strptime(d2, "%Y-%m-%d")).days) <= 1
+    except Exception:
+        return False
+
+
 def do_audit():
     con = db()
     pend = con.execute("SELECT rowid,div,kickoff,home,away,market,odd FROM predictions WHERE status='PENDING'").fetchall()
@@ -474,8 +632,8 @@ def do_audit():
     settled = 0
     for rid, div, ko, home, away, mk, odd in pend:
         for r in texts.get(div, []):
-            if pdate(r.get("Date")) == ko and (r.get("HomeTeam") or "").strip() == home \
-                    and (r.get("AwayTeam") or "").strip() == away:
+            if date_close(pdate(r.get("Date")), ko) and (same_team(r.get("HomeTeam"), home)
+                                                           or same_team(r.get("AwayTeam"), away)):
                 hg, ag = fi(r.get("FTHG")), fi(r.get("FTAG"))
                 if hg is None or ag is None:
                     break
