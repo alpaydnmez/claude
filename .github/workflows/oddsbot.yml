@@ -27,6 +27,8 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      ODDS_API_LEAGUES: ${{ vars.ODDS_API_LEAGUES }}
       GH_TOKEN: ${{ github.token }}
       EVENT: ${{ github.event_name }}
       SCHEDULE: ${{ github.event.schedule }}
